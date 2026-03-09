@@ -1,0 +1,99 @@
+blueprint:
+  name: SONOFF TRVZB External Temperature Sync
+  description: |
+    Synchronizes an external temperature sensor with a SONOFF TRVZB thermostat via Zigbee2MQTT.
+
+    Update behavior:
+    - Updates whenever the temperature sensor changes by more than the configured minimum difference.
+    - A forced refresh is sent at least every 20 minutes (required: external_temperature_input
+      must be refreshed within 2 hours or the TRV enters fail-safe mode using its own temperature).
+
+    Assumptions and requirements:
+    - The selected SONOFF TRVZB device is paired via Zigbee2MQTT.
+    - `external_temperature_input` accepts direct °C values in the range 0.0–99.9 (step 0.1).
+    - Zigbee2MQTT topic format is `zigbee2mqtt/<friendly_name>/set/external_temperature_input`,
+      where `<friendly_name>` equals the Home Assistant MQTT device name.
+    - The timer input must be a dedicated timer entity used only by this automation.
+  domain: automation
+  author: Home Assistant Community
+  input:
+    sonoff_device:
+      name: SONOFF TRVZB Device
+      description: Select your SONOFF TRVZB thermostat device
+      selector:
+        device:
+          integration: mqtt
+          manufacturer: SONOFF
+    temperature_sensor:
+      name: External Temperature Sensor
+      description: The room temperature sensor to sync with the thermostat
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    timer_entity:
+      name: Update Timer
+      description: Timer entity for tracking maximum update intervals (20 min forced refresh)
+      selector:
+        entity:
+          domain: timer
+    min_temp_difference:
+      name: Minimum Temperature Difference
+      description: Minimum temperature change (in °C) required to trigger an update
+      default: 0.1
+      selector:
+        number:
+          min: 0.1
+          max: 2.0
+          step: 0.1
+          unit_of_measurement: "°C"
+          mode: slider
+
+variables:
+  device: !input sonoff_device
+  temp_sensor_id: !input temperature_sensor
+  timer_entity_id: !input timer_entity
+  temp_difference: !input min_temp_difference
+  current_temp: "{{ [0.0, [99.9, states(temp_sensor_id) | float(0)] | min] | max | round(1) }}"
+  thermostat_sensor_entity: >-
+    {{ device_entities(device) | select('search', 'number.*external_temperature_input') | first }}
+  thermostat_temp: "{{ states(thermostat_sensor_entity) | float(0) }}"
+  max_update_minutes: 20
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input temperature_sensor
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input timer_entity
+
+conditions:
+  - condition: template
+    value_template: "{{ states(temp_sensor_id) | is_number }}"
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: >
+          {{ (thermostat_temp - current_temp) | abs >= temp_difference }}
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none
+             or now() - state_attr(this.entity_id, 'last_triggered') > timedelta(minutes=max_update_minutes) }}
+      - condition: state
+        entity_id: !input timer_entity
+        state: idle
+
+actions:
+  - action: mqtt.publish
+    data:
+      topic: "zigbee2mqtt/{{ device_attr(device, 'name') }}/set/external_temperature_input"
+      payload: "{{ current_temp }}"
+  - action: timer.start
+    target:
+      entity_id: !input timer_entity
+    data:
+      duration: "{{ max_update_minutes * 60 }}"

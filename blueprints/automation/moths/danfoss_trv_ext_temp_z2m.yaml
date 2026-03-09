@@ -1,0 +1,105 @@
+blueprint:
+  name: Danfoss Ally External Temperature Sync
+  description: |
+    Synchronizes an external temperature sensor with a Danfoss Ally thermostat.
+    Follows Danfoss recommendations for update intervals based on radiator covered state.
+
+    Update behavior:
+    - Auto Offset Mode (radiator_covered=off): update every 30 min OR 0.1 C change, with max refresh before 3 hours (timer set to 175 min).
+    - Covered Radiator Mode (radiator_covered=on): update every 5 min OR 0.1 C change, with max refresh before 30 minutes (timer set to 28 min).
+
+    Assumptions and requirements:
+    - The selected Danfoss MQTT device exposes an entity ending with `radiator_covered` (boolean on/off).
+    - The selected Danfoss MQTT device exposes an entity matching `number.*_external_measured_room_sensor`.
+    - `external_measured_room_sensor` values are centi-degrees C (e.g. 2150 = 21.50 C, -8000 disables the function in Danfoss spec).
+    - The external temperature input entity is in degrees C and is converted to centi-degrees before publishing to the Danfoss MQTT device.
+    - Zigbee2MQTT topic format is `zigbee2mqtt/<friendly_name>/set/external_measured_room_sensor`, where `<friendly_name>` equals the Home Assistant MQTT device name.
+    - The timer input must be a dedicated timer entity used only by this automation.
+  domain: automation
+  author: Home Assistant Community
+  input:
+    danfoss_device:
+      name: Danfoss Ally Device
+      description: Select your Danfoss Ally thermostat device
+      selector:
+        device:
+          integration: mqtt
+          manufacturer: Danfoss
+    temperature_sensor:
+      name: External Temperature Sensor
+      description: The room temperature sensor to sync with the thermostat
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    timer_entity:
+      name: Update Timer
+      description: Timer entity for tracking maximum update intervals
+      selector:
+        entity:
+          domain: timer
+    min_temp_difference:
+      name: Minimum Temperature Difference
+      description: Minimum temperature difference (in °C) to trigger an update
+      default: 0.1
+      selector:
+        number:
+          min: 0.05
+          max: 1.0
+          step: 0.05
+          unit_of_measurement: "°C"
+          mode: slider
+
+variables:
+  device: !input danfoss_device
+  temp_sensor_id: !input temperature_sensor
+  timer_entity_id: !input timer_entity
+  temp_difference: !input min_temp_difference
+  current_temp: "{{ states(temp_sensor_id) | float(0) }}"
+  radiator_covered_entity: >-
+    {{ device_entities(device) | select('match', '.*radiator_covered$') | first }}
+  radiator_covered_state: "{{ states(radiator_covered_entity) }}"
+  thermostat_sensor_entity: >-
+    {{ device_entities(device) | select('search', 'number.*_external_measured_room_sensor') | first }}
+  thermostat_temp: "{{ states(thermostat_sensor_entity) | float(0) }}"
+  min_update_minutes: "{{ 5 if radiator_covered_state == 'on' else 30 }}"
+  max_update_minutes: "{{ 28 if radiator_covered_state == 'on' else 175 }}"
+  temp_diff_centidegrees: "{{ (temp_difference * 100) | int }}"
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input temperature_sensor
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input timer_entity
+
+conditions:
+  - condition: template
+    value_template: "{{ states(temp_sensor_id) | is_number }}"
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: >
+          {{ (thermostat_temp - current_temp * 100) | abs >= temp_diff_centidegrees }}
+      - condition: template
+        value_template: >
+          {{ state_attr(this.entity_id, 'last_triggered') is none 
+             or now() - state_attr(this.entity_id, 'last_triggered') > timedelta(minutes=min_update_minutes) }}
+      - condition: state
+        entity_id: !input timer_entity
+        state: idle
+
+actions:
+  - action: mqtt.publish
+    data:
+      topic: "zigbee2mqtt/{{ device_attr(device, 'name') }}/set/external_measured_room_sensor"
+      payload: "{{ (current_temp * 100) | round(0) | int }}"
+  - action: timer.start
+    target:
+      entity_id: !input timer_entity
+    data:
+      duration: "{{ max_update_minutes * 60 }}"
